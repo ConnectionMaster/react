@@ -84,7 +84,7 @@
 // regardless of priority. Intermediate state may vary according to system
 // resources, but the final state is always the same.
 
-import type {Fiber} from './ReactInternalTypes';
+import type {Fiber, FiberRoot} from './ReactInternalTypes';
 import type {Lanes, Lane} from './ReactFiberLane.new';
 
 import {
@@ -92,6 +92,9 @@ import {
   NoLanes,
   isSubsetOfLanes,
   mergeLanes,
+  isTransitionLane,
+  intersectLanes,
+  markRootEntangled,
 } from './ReactFiberLane.new';
 import {
   enterDisallowedContextReadInDEV,
@@ -101,7 +104,7 @@ import {Callback, ShouldCapture, DidCapture} from './ReactFiberFlags';
 
 import {debugRenderPhaseSideEffectsForStrictMode} from 'shared/ReactFeatureFlags';
 
-import {StrictMode} from './ReactTypeOfMode';
+import {StrictLegacyMode} from './ReactTypeOfMode';
 import {
   markSkippedUpdateLanes,
   isInterleavedUpdate,
@@ -128,6 +131,7 @@ export type Update<State> = {|
 export type SharedQueue<State> = {|
   pending: Update<State> | null,
   interleaved: Update<State> | null,
+  lanes: Lanes,
 |};
 
 export type UpdateQueue<State> = {|
@@ -167,6 +171,7 @@ export function initializeUpdateQueue<State>(fiber: Fiber): void {
     shared: {
       pending: null,
       interleaved: null,
+      lanes: NoLanes,
     },
     effects: null,
   };
@@ -257,6 +262,34 @@ export function enqueueUpdate<State>(
       );
       didWarnUpdateInsideUpdate = true;
     }
+  }
+}
+
+export function entangleTransitions(root: FiberRoot, fiber: Fiber, lane: Lane) {
+  const updateQueue = fiber.updateQueue;
+  if (updateQueue === null) {
+    // Only occurs if the fiber has been unmounted.
+    return;
+  }
+
+  const sharedQueue: SharedQueue<mixed> = (updateQueue: any).shared;
+  if (isTransitionLane(lane)) {
+    let queueLanes = sharedQueue.lanes;
+
+    // If any entangled lanes are no longer pending on the root, then they must
+    // have finished. We can remove them from the shared queue, which represents
+    // a superset of the actually pending lanes. In some cases we may entangle
+    // more than we need to, but that's OK. In fact it's worse if we *don't*
+    // entangle when we should.
+    queueLanes = intersectLanes(queueLanes, root.pendingLanes);
+
+    // Entangle the new transition lane with the other transition lanes.
+    const newQueueLanes = mergeLanes(queueLanes, lane);
+    sharedQueue.lanes = newQueueLanes;
+    // Even if queue.lanes already include lane, we don't know for certain if
+    // the lane finished since the last time we entangled it. So we need to
+    // entangle it again, just to be sure.
+    markRootEntangled(root, newQueueLanes);
   }
 }
 
@@ -359,7 +392,7 @@ function getStateFromUpdate<State>(
         if (__DEV__) {
           if (
             debugRenderPhaseSideEffectsForStrictMode &&
-            workInProgress.mode & StrictMode
+            workInProgress.mode & StrictLegacyMode
           ) {
             disableLogs();
             try {
@@ -392,7 +425,7 @@ function getStateFromUpdate<State>(
         if (__DEV__) {
           if (
             debugRenderPhaseSideEffectsForStrictMode &&
-            workInProgress.mode & StrictMode
+            workInProgress.mode & StrictLegacyMode
           ) {
             disableLogs();
             try {
@@ -547,7 +580,12 @@ export function processUpdateQueue<State>(
           instance,
         );
         const callback = update.callback;
-        if (callback !== null) {
+        if (
+          callback !== null &&
+          // If the update was already committed, we should not queue its
+          // callback again.
+          update.lane !== NoLane
+        ) {
           workInProgress.flags |= Callback;
           const effects = queue.effects;
           if (effects === null) {
@@ -595,6 +633,10 @@ export function processUpdateQueue<State>(
         newLanes = mergeLanes(newLanes, interleaved.lane);
         interleaved = ((interleaved: any).next: Update<State>);
       } while (interleaved !== lastInterleaved);
+    } else if (firstBaseUpdate === null) {
+      // `queue.lanes` is used for entangling transitions. We can set it back to
+      // zero once the queue is empty.
+      queue.shared.lanes = NoLanes;
     }
 
     // Set the remaining expiration time to be whatever is remaining in the queue.
